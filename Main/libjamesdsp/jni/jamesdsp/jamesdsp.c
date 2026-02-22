@@ -593,6 +593,40 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 		if (cep->psize == 4 && cep->vsize == 4)
 		{
 			int32_t cmd = ((int32_t *)cep)[3];
+			// Extended Spectrum Extension commands use 32-bit IDs (>= 65536).
+			if (cmd == 65548)
+			{
+				int32_t spectrumExtensionEnabled = ((int32_t*)cep)[4];
+				if (!spectrumExtensionEnabled)
+					SpectrumExtensionDisable(&dspmain->jdsp);
+				else
+					SpectrumExtensionEnable(&dspmain->jdsp);
+#ifdef DEBUG
+				LOGE("Spectrum extension enabled: %d", spectrumExtensionEnabled);
+#endif
+				*replyData = 0;
+				return 0;
+			}
+			if (cmd == 65549)
+			{
+				int32_t referenceFrequency = ((int32_t*)cep)[4];
+				SpectrumExtensionSetReferenceFrequency(&dspmain->jdsp, (int)referenceFrequency);
+#ifdef DEBUG
+				LOGE("Spectrum extension reference frequency: %d", referenceFrequency);
+#endif
+				*replyData = 0;
+				return 0;
+			}
+			if (cmd == 65550)
+			{
+				int32_t barkReconstruct = ((int32_t*)cep)[4];
+				SpectrumExtensionSetExciter(&dspmain->jdsp, (float)barkReconstruct / 100.0f);
+#ifdef DEBUG
+				LOGE("Spectrum extension bark reconstruct: %d", barkReconstruct);
+#endif
+				*replyData = 0;
+				return 0;
+			}
 			if (cmd == 25000)
 			{
 				dspmain->hashSlot[0] = ((int32_t*)cep)[4];
@@ -783,8 +817,8 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 					mode = 2;
 				if (gain < 0.0f)
 					gain = 0.0f;
-				if (gain > 2.5f)
-					gain = 2.5f;
+				if (gain > 8.0f)
+					gain = 8.0f;
 
 				ClaritySetParam(
 					&dspmain->jdsp,

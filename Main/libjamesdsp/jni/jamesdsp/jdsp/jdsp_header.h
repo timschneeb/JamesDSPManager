@@ -178,25 +178,35 @@ typedef struct
 } DBB;
 typedef struct
 {
-	float b0, b1, b2;
-	float a1, a2;
-	float z1[2], z2[2];
+	double b0, b1, b2;
+	double a1, a2;
+	double x1, x2;
+	double y1, y2;
 } SpectrumExtBiquad;
 typedef struct
 {
+	double coeffs[11];
+	double prevOut;
+	double prevLast;
+	uint32_t sampleCounter;
+	uint32_t biggestCoeff;
+} SpectrumExtHarmonic;
+typedef struct
+{
 	int enabled;
-	int safetyEnabled;
-	float strengthLinear;
+	int samplingRate;
 	int referenceFreq;
+	float exciter;
 	float wetMix;
-	float dryMix; // Kept at unity for parallel-add topology (dry + wet).
 	float postGain;
+	char safetyEnabled;
 	float hpQ;
 	float lpQ;
 	int lpOffsetHz;
-	double harmonics[10];
-	SpectrumExtBiquad hp;
-	SpectrumExtBiquad lp;
+	float harmonicSeed[10];
+	SpectrumExtBiquad highpass[2];
+	SpectrumExtBiquad lowpass[2];
+	SpectrumExtHarmonic harmonics[2];
 } SpectrumExtension;
 //   sf_reverb_state_st rv;
 //   sf_presetreverb(&rv, 44100, SF_REVERB_PRESET_DEFAULT);
@@ -653,6 +663,9 @@ extern void BassBoostProcess(JamesDSPLib *jdsp, size_t n);
 extern "C" {
 #endif
 extern void SpectrumExtensionConstructor(JamesDSPLib *jdsp);
+extern void SpectrumExtensionSetSamplingRate(JamesDSPLib *jdsp, int samplingRate);
+extern void SpectrumExtensionSetReferenceFrequency(JamesDSPLib *jdsp, int referenceFreq);
+extern void SpectrumExtensionSetExciter(JamesDSPLib *jdsp, float exciter);
 extern void SpectrumExtensionSetParam(JamesDSPLib *jdsp, float strengthLinear, int referenceFreq, float wetMix, float postGainDb, char safetyEnabled, float hpQ, float lpQ, int lpOffsetHz, const double harmonics[10]);
 extern void SpectrumExtensionRefresh(JamesDSPLib *jdsp);
 extern void SpectrumExtensionEnable(JamesDSPLib *jdsp);

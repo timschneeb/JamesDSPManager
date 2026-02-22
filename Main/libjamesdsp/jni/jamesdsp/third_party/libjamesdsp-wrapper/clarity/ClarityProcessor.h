@@ -77,7 +77,7 @@ private:
     IIR1 filters[2];
     float prevIn[2] = {0.0f, 0.0f};
     uint32_t samplingRate = DEFAULT_SR;
-    float gain = 0.0f;
+    float gain = 1.0f;
     float nyquistOffsetHz = 1000.0f;
 };
 
@@ -157,7 +157,7 @@ private:
     bool enabled = false;
     Mode mode = Mode::NATURAL;
     uint32_t samplingRate = DEFAULT_SR;
-    float gain = 1.0f;
+    float gain = 0.0f;
     float postGainLinear = 1.0f;
 
     bool safetyEnabled = false;

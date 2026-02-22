@@ -4,7 +4,6 @@ extern "C" {
 
 #include <cstdint>
 #include <cstdlib>
-#include <cmath>
 #include <new>
 
 #include "ClarityProcessor.h"
@@ -136,7 +135,7 @@ extern "C" void ClaritySetParam(
     }
 
     clarity->setMode(mode);
-    clarity->setGainLinear(fmaxf(0.0f, gain));
+    clarity->setGainLinear(gain);
     clarity->setPostGainDb(postGainDb);
     clarity->setSafety(safetyEnabled != 0, safetyThresholdDb, safetyReleaseMs);
     clarity->setNaturalLpfOffsetHz(naturalLpfOffsetHz);

@@ -4,10 +4,6 @@
 #include <math.h>
 #include <float.h>
 #include "../jdsp_header.h"
-#if defined(__ANDROID__)
-#include <android/log.h>
-#define TAG "EffectDSPMain"
-#endif
 
 #define EQ_MODE_VIPER_ORIGINAL 6
 
@@ -69,13 +65,11 @@ static int ViperEqSolveRoot(double a, double b, double c, double *root)
 static void ViperEqUpdateCoeffs(MultimodalEQ *eq, double sampleRate)
 {
 	const double bandwidthOctaves = 1.0;
+	memset(eq->viperCoeff0, 0, sizeof(eq->viperCoeff0));
+	memset(eq->viperCoeff1, 0, sizeof(eq->viperCoeff1));
+	memset(eq->viperCoeff2, 0, sizeof(eq->viperCoeff2));
 	if (sampleRate <= 0.0)
-	{
-		memset(eq->viperCoeff0, 0, sizeof(eq->viperCoeff0));
-		memset(eq->viperCoeff1, 0, sizeof(eq->viperCoeff1));
-		memset(eq->viperCoeff2, 0, sizeof(eq->viperCoeff2));
 		return;
-	}
 	for (int i = 0; i < VIPER_EQ_BANDS; i++)
 	{
 		double f1 = ViperEqFindF1(VIPER_EQ_CENTER_FREQS[i], bandwidthOctaves);
@@ -97,18 +91,6 @@ static void ViperEqUpdateCoeffs(MultimodalEQ *eq, double sampleRate)
 			eq->viperCoeff0[i] = (float)(root + root);
 			eq->viperCoeff1[i] = (float)(0.5 - root);
 			eq->viperCoeff2[i] = (float)((root + 0.5) * cosX * 2.0);
-		}
-		else
-		{
-#if defined(__ANDROID__)
-			__android_log_print(ANDROID_LOG_WARN, TAG, "ViperEqSolveRoot failed for band %d (err=%d); using stable fallback coeffs", i, solveResult);
-#else
-			fprintf(stderr, "ViperEqSolveRoot failed for band %d (err=%d); using stable fallback coeffs\n", i, solveResult);
-#endif
-			/* ViperEqSolveRoot fallback: H(z)=coeff1*(1-z^-2) with eq->viperCoeff0/1/2=(0,1,0); this avoids muting, but true unity pass-through is not representable in this form. */
-			eq->viperCoeff0[i] = 0.0f;
-			eq->viperCoeff1[i] = 1.0f;
-			eq->viperCoeff2[i] = 0.0f;
 		}
 	}
 }
@@ -266,6 +248,7 @@ double reverseProjectX(double pos, double MIN_FREQ, double MAX_FREQ)
 }
 void MultimodalEqualizerAxisInterpolation(JamesDSPLib *jdsp, int interpolationMode, int operatingMode, double *freqAx, double *gaindB)
 {
+	const int previousOperatingMode = jdsp->mEQ.operatingMode;
 	const int isIirHshosvfMode = operatingMode >= 1 && operatingMode <= 5;
 	const double gainClampLimitDb = isIirHshosvfMode ? 24.0 : 64.0;
 	memcpy(jdsp->mEQ.freq + 1, freqAx, NUMPTS * sizeof(double));
@@ -313,14 +296,12 @@ void MultimodalEqualizerAxisInterpolation(JamesDSPLib *jdsp, int interpolationMo
 		for (int i = 0; i < VIPER_EQ_BANDS; i++)
 		{
 			double gainDb = getValueAt(curve, VIPER_EQ_CENTER_FREQS[i]);
-			if (interpolationMode)
-			{
-				if (gainDb < -gainClampLimitDb)
-					gainDb = -gainClampLimitDb;
-				if (gainDb > gainClampLimitDb)
-					gainDb = gainClampLimitDb;
-			}
 			ViperEqSetBandLevel(&jdsp->mEQ, i, gainDb);
+		}
+		if (previousOperatingMode != EQ_MODE_VIPER_ORIGINAL)
+		{
+			ViperEqUpdateCoeffs(&jdsp->mEQ, jdsp->fs);
+			ViperEqResetState(&jdsp->mEQ);
 		}
 	}
 	else

@@ -130,8 +130,12 @@ void NoiseSharpening::process(float* buffer, uint32_t frames) {
             const float sample = buffer[idx];
             const float prev = prevIn[ch];
             prevIn[ch] = sample;
-            const float boosted = sample + (sample - prev) * gain;
-            buffer[idx] = filters[ch].process(boosted);
+            const float xIn = sample + (sample - prev) * gain;
+            IIR1& filter = filters[ch];
+            const float hist = xIn * filter.b1;
+            const float out = filter.prevSample + xIn * filter.b0;
+            filter.prevSample = xIn * filter.a1 + hist;
+            buffer[idx] = out;
         }
     }
 }
@@ -234,7 +238,12 @@ void ClarityProcessor::setSamplingRate(uint32_t sr) {
     reset();
 }
 
-void ClarityProcessor::setEnabled(bool e) { enabled = e; }
+void ClarityProcessor::setEnabled(bool e) {
+    if (e && !enabled) {
+        reset();
+    }
+    enabled = e;
+}
 
 void ClarityProcessor::setMode(int m) {
     const auto newMode = static_cast<Mode>(std::clamp(m, 0, 2));
@@ -245,8 +254,16 @@ void ClarityProcessor::setMode(int m) {
 }
 
 void ClarityProcessor::setGainLinear(float linear) {
-    gain = std::max(0.0f, linear);
-    syncFilterGain();
+    const float nextGain = std::max(0.0f, linear);
+    if (std::fabs(nextGain - gain) < 1e-7f) {
+        return;
+    }
+    gain = nextGain;
+    if (mode == Mode::OZONE) {
+        reset();
+    } else {
+        syncFilterGain();
+    }
 }
 
 void ClarityProcessor::setPostGainDb(float db) {
