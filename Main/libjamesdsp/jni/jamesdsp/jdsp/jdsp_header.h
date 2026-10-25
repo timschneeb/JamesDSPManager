@@ -10,6 +10,11 @@
 #include "Effects/eel2/eelCommon.h"
 #include "generalDSP/ArbFIRGen.h"
 #define MAX_BENCHMARK (10)
+/* Forward declaration: struct dspsys is first referenced by callback fields
+ * (e.g. Crossfeed.process) before its definition below. Without this the tag
+ * gets scoped to the enclosing declaration and function pointer types become
+ * incompatible under clang 16+ (-Wincompatible-function-pointer-types). */
+struct dspsys;
 // Misc
 extern double mapVal(double x, double in_min, double in_max, double out_min, double out_max);
 extern double mag2dB(double lin);
@@ -26,45 +31,54 @@ extern int upper_bound(double *a, int n, double x);
 extern int lower_bound(double *a, int n, double x);
 extern size_t fast_upper_bound(double *a, size_t n, double x);
 extern size_t fast_lower_bound(double *a, size_t n, double x);
-extern void fhtbitReversalTbl(unsigned *dst, unsigned int n);
 extern void fhtsinHalfTblFloat(float *dst, unsigned int n);
 extern void LLdiscreteHartleyFloat(float *A, const int nPoints, const float *sinTab);
 extern double randXorshift(uint64_t s[2]);
 // Misc end
 typedef struct
 {
+	int enabled;
 	float threshold;
 	float relCoef;
 	float envOverThreshold;
 } JLimiter;
 #define FFTSIZE_DRS (8192)
-#define ANALYSIS_OVERLAP_DRS 4
-#define OVPSIZE_DRS (FFTSIZE_DRS / ANALYSIS_OVERLAP_DRS)
+#define ANALYSIS_OVERLAP_DRS_MAX (8)
 #define HALFWNDLEN_DRS ((FFTSIZE_DRS >> 1) + 1)
 #define MAX_OUTPUT_BUFFERS_DRS 2
 #define NUMPTS_DRS (7)
 #define DYN_BANDS_GAMMATONE (16)
 #define MAXORDER (12)
 #define MAXSECTIONS (MAXORDER >> 1)
+// number of points of pre and post padding used to set initial conditions
+#define PREPAD (200) // Max pad
+#define POSPAD (200) // Max pad
 typedef struct
 {
+	float real, imag;
+} cplx;
+typedef struct
+{
+	double real, imag;
+} cplxDouble;
+typedef struct str_dynfreqdomain
+{
 	// Frequency domain
-	// Constant
-	unsigned int fftLen, minus_fftLen, ovpLen, halfLen, smpShift, procUpTo;
+	float analysisWnd[FFTSIZE_DRS];
+	unsigned int fftLen, minus_fftLen, ovpLen, ovpCount, halfLen, smpShift, procUpTo;
 	void(*fft)(float*, const float*);
 	unsigned int mBitRev[FFTSIZE_DRS];
 	float 	mSineTab[FFTSIZE_DRS >> 1];
-	float analysisWnd[FFTSIZE_DRS];
 	float synthesisWnd[FFTSIZE_DRS];
 	// Shared variable between all FFT length and modes and channel config
 	int  mOutputReadSampleOffset;
 	int  mOutputBufferCount; // How many buffers are actually in use
 	unsigned int mInputSamplesNeeded;
 	float 	*mOutputBuffer[MAX_OUTPUT_BUFFERS_DRS];
-	float buffer[MAX_OUTPUT_BUFFERS_DRS][OVPSIZE_DRS * 2];
+	float buffer[MAX_OUTPUT_BUFFERS_DRS][FFTSIZE_DRS >> 1];
 	unsigned int mInputPos;
 	float 	mInput[2][FFTSIZE_DRS];
-	float 	mOverlapStage2dash[2][OVPSIZE_DRS];
+	float mOverlapStage2dash[2][ANALYSIS_OVERLAP_DRS_MAX][FFTSIZE_DRS >> 1];
 	float 	mTempLBuffer[FFTSIZE_DRS];
 	float 	mTempRBuffer[FFTSIZE_DRS];
 	float timeDomainOut[2][FFTSIZE_DRS];
@@ -113,6 +127,19 @@ typedef struct
 	int updateIdx;
 	// Global variable
 	int granularity, tfresolution;
+	// CWT
+	unsigned int reqSynthesisWnd;
+	float gauss_c1[PREPAD + HALFWNDLEN_DRS + POSPAD - 1], gauss_c2[PREPAD + HALFWNDLEN_DRS + POSPAD - 1], gauss_b[PREPAD + HALFWNDLEN_DRS + POSPAD - 1];
+	unsigned int prepad, pospad;
+	unsigned int bitrevfftshift[FFTSIZE_DRS];
+	float corrF[HALFWNDLEN_DRS];
+	void (*process)(struct str_dynfreqdomain *);
+	float shiftCentre[HALFWNDLEN_DRS];
+	float scalarGain;
+	float fftBuf[2][FFTSIZE_DRS], getbackCorrectedToSpectrum1[2][FFTSIZE_DRS];
+	float real[2][HALFWNDLEN_DRS], imag[2][HALFWNDLEN_DRS];
+	float specHannReal[2][PREPAD + HALFWNDLEN_DRS + POSPAD - 1], specHannImag[2][PREPAD + HALFWNDLEN_DRS + POSPAD - 1];
+	cplx tmp[2][PREPAD + HALFWNDLEN_DRS + POSPAD - 1];
 } FFTCompander;
 typedef struct
 {
@@ -121,6 +148,69 @@ typedef struct
 	SixBandsCrossover subband[2];
 	float pregain, postgain;
 } VacuumTube;
+// Harmonic Expander (Chebyshev waveshaper, harmonics 2–10)
+typedef struct
+{
+	float b0, b1, b2, a1, a2, x1, x2, y1, y2;
+} HRBiquadHP;
+typedef struct
+{
+	float prevX, prevY;
+} HRDCBlocker;
+typedef struct
+{
+	float harmonicGain[9];    // per-harmonic gain for harmonics 2–10 (0–100 %)
+	float mix;                // wet/dry mix (0.0–1.0)
+	float crossoverFreq;      // high-pass crossover for band extraction
+	HRBiquadHP bandHP[2];
+	HRDCBlocker dc[2];
+} HarmonicExpander;
+// Sub-Harmonic Expander (sub-harmonic synthesiser, 10 sub-harmonics)
+typedef struct
+{
+	float b0, b1, b2, a1, a2, x1, x2, y1, y2;
+} SHBiquadStage;
+typedef struct
+{
+	SHBiquadStage stage1, stage2;
+} SHBiquadLP4;
+typedef struct
+{
+	float subHarmonicGain[9];  // per-subharmonic gain for f/2–f/10 (0–100 %)
+	float mix;                 // wet/dry mix (0.0–1.0)
+	float crossoverFreq;       // low-pass crossover for band extraction
+	SHBiquadLP4 bandLP[2];     // band extraction low-pass (L/R)
+	SHBiquadLP4 outLP[2];      // output low-pass (L/R)
+	// Frequency tracking state
+	float phase[2];            // phase accumulator (L/R)
+	int lastSign[2];           // last sign for zero-crossing detection
+	int samplesSinceLastCrossing[2];
+	float detectedFreq[2];     // detected fundamental frequency (L/R)
+	// Envelope follower
+	float env[2];              // envelope (L/R)
+	float envAttackCoef;       // attack coefficient
+	float envReleaseCoef;      // release coefficient
+} SubHarmonicExpander;
+// NOS R2R Simulator
+typedef struct
+{
+	double srcRate;
+	double targetRate;
+	double ratio;
+	int bitDepth;
+	double resistorTolerance;
+	int deviationGrowth;
+	int harmony;        // 0=Random, 1=Even, 2=Odd
+	long serialNumber;
+	double jitterAmount;
+	double harmonicsAmount;
+	int invertPhase;
+	double fracAccum;
+	float lastSampleL, lastSampleR;
+	double bitDeviation[24];
+	double bitDeviationR[24];
+	int deviationValid;
+} NosR2R;
 typedef struct
 {
 	float inputs[1024];
@@ -502,6 +592,15 @@ typedef struct dspsys
 	// Vacuum tube
 	int tubeEnabled;
 	VacuumTube tube;
+	// Harmonic Expander
+	int harmonicExpanderEnabled;
+	HarmonicExpander harmonicExpander;
+	// Sub-Harmonic Expander
+	int subHarmonicExpanderEnabled;
+	SubHarmonicExpander subHarmonicExpander;
+	// NOS R2R Simulator
+	int nosR2REnabled;
+	NosR2R nosR2R;
 	// Crossfeed
 	int crossfeedEnabled, crossfeedForceRefresh;
 	Crossfeed advXF;
@@ -553,9 +652,12 @@ typedef struct dspsys
 	uint64_t rndstate[2];
 } JamesDSPLib;
 // JamesDSP controller
-extern void JamesDSPGlobalMemoryAllocation(int do_benchmark);
+extern void JamesDSPGlobalMemoryAllocation();
 extern void JamesDSPGlobalMemoryDeallocation();
 extern void JamesDSPReallocateBlock(JamesDSPLib *jdsp, size_t blockSizeMax);
+extern void JamesDSP_Load_benchmark(double *_c0, double *_c1);
+extern void JamesDSP_Save_benchmark(double *_c0, double *_c1);
+extern void JamesDSP_Start_benchmark();
 extern void jdsp_lock(JamesDSPLib *jdsp);
 extern void jdsp_unlock(JamesDSPLib *jdsp);
 extern void JamesDSPFree(JamesDSPLib *jdsp);
@@ -566,11 +668,12 @@ extern void JamesDSPSetSampleRate(JamesDSPLib *jdsp, float new_sample_rate, int 
 extern int selectConvPartitions(JamesDSPLib *jdsp, unsigned int impulseLengthActual, unsigned int *seg2Len);
 // Limiter
 extern void JLimiterSetCoefficients(JamesDSPLib *jdsp, double thresholddB, double msRelease);
+extern void JLimiterSetEnable(JamesDSPLib *jdsp, int enable);
 extern void JLimiterInit(JamesDSPLib *jdsp);
 // Compressor
 extern void CompressorConstructor(JamesDSPLib *jdsp);
 extern void CompressorDestructor(JamesDSPLib *jdsp);
-extern void CompressorSetParam(JamesDSPLib *jdsp, float fgt_facT, int granularity, int tfresolution);
+extern void CompressorSetParam(JamesDSPLib *jdsp, float fgt_facT, int granularity, int tfresolution, char forceRefresh);
 extern void CompressorSetGain(JamesDSPLib *jdsp, double *freq, double *gains, char cpy);
 extern void CompressorEnable(JamesDSPLib *jdsp, char enable);
 extern void CompressorDisable(JamesDSPLib *jdsp);
@@ -599,6 +702,26 @@ extern void VacuumTubeEnable(JamesDSPLib *jdsp);
 extern void VacuumTubeDisable(JamesDSPLib *jdsp);
 extern void VacuumTubeSetGain(JamesDSPLib *jdsp, double dbGain);
 extern void VacuumTubeProcess(JamesDSPLib *jdsp, size_t n);
+// Harmonic Expander
+extern void HarmonicExpanderConstructor(JamesDSPLib *jdsp);
+extern void HarmonicExpanderEnable(JamesDSPLib *jdsp);
+extern void HarmonicExpanderDisable(JamesDSPLib *jdsp);
+extern void HarmonicExpanderSetParam(JamesDSPLib *jdsp, float harmonicGains[9], float crossoverFreq, float mix);
+extern void HarmonicExpanderProcess(JamesDSPLib *jdsp, size_t n);
+// Sub-Harmonic Expander
+extern void SubHarmonicExpanderConstructor(JamesDSPLib *jdsp);
+extern void SubHarmonicExpanderEnable(JamesDSPLib *jdsp);
+extern void SubHarmonicExpanderDisable(JamesDSPLib *jdsp);
+extern void SubHarmonicExpanderSetParam(JamesDSPLib *jdsp, float subHarmonicGains[9], float crossoverFreq, float mix);
+extern void SubHarmonicExpanderProcess(JamesDSPLib *jdsp, size_t n);
+// NOS R2R Simulator
+extern void NosR2REnable(JamesDSPLib *jdsp);
+extern void NosR2RDisable(JamesDSPLib *jdsp);
+extern void NosR2RSetParam(JamesDSPLib *jdsp, double targetRate, int bitDepth,
+                           double resistorTolerance, int deviationGrowth,
+                           int harmony, long serialNumber,
+                           double jitterAmount, double harmonicsAmount, int invertPhase);
+extern void NosR2RProcess(JamesDSPLib *jdsp, size_t n);
 // Live programmable effect
 extern const char* checkErrorCode(int errCode);
 extern void LiveProgConstructor(JamesDSPLib *jdsp);

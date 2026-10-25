@@ -8,12 +8,16 @@
 #endif
 #include <string.h>
 #include <math.h>
+#include <unistd.h>
 #include "essential.h"
 // Effect section
 #include "jdsp/jdsp_header.h"
+#include "peq_loudness.h"
 typedef struct
 {
 	unsigned long long initializeForFirst;
+	int32_t engineImpulseResponseHash;
+	int32_t hashSlot[4];
 	int mEnable;
 	JamesDSPLib jdsp;
     float mSamplingRate;
@@ -27,6 +31,9 @@ typedef struct
 	int numTime2Send, samplesInc, stringIndex;
 	int16_t impChannels;
 	int32_t impulseLengthActual, convolverNeedRefresh;
+	// PEQ and loudness (root version extensions)
+	peq_cascade_t peq;
+	loudness_t loudness;
 } EffectDSPMain;
 typedef struct
 {
@@ -47,6 +54,8 @@ void EffectDSPMainConstructor(EffectDSPMain *dspmain)
 	dspmain->samplesInc = 0;
 	dspmain->stringIndex = 0;
 	JamesDSPInit(&dspmain->jdsp, 128, 48000.0f);
+	peq_cascade_init(&dspmain->peq);
+	loudness_init(&dspmain->loudness);
 }
 void EffectDSPMainDestructor(EffectDSPMain *dspmain)
 {
@@ -152,7 +161,38 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 			return 0;
 		}
 		// Set sample rate
+		double oldFs = (double)dspmain->jdsp.fs;
 		JamesDSPSetSampleRate(&dspmain->jdsp, dspmain->mSamplingRate, 0);
+		double newFs = (double)dspmain->jdsp.fs;
+		/* Если частота дискретизации изменилась, перенастраиваем PEQ и loudness
+		 * на новую fs. Коэффициенты biquad зависят от частоты дискретизации,
+		 * и без перенастройки частоты фильтров сдвигаются (например, на HiBy R4
+		 * при переключении deep_buffer 44100 ↔ primary 48000).
+		 * peq_cascade_configure и loudness_configure принимуют sample rate
+		 * и пересчитывают все коэффициенты.
+		 * Сохраняем текущие параметры и переотправляем с новым sample rate.
+		 * Это безопасно: если PEQ/loudness не были настроены, bandCount=0 и
+		 * neutral=true, и функции просто обновят sampleRate без эффекта. */
+		if (oldFs != newFs)
+		{
+			/* Обновляем sampleRate в PEQ и пересчитываем biquad-коэффициенты.
+			 * К сожалению, оригинальные данные параметра (fdata) не сохраняются,
+			 * поэтому мы переинициализируем только sampleRate и помечаем
+			 * коэффициенты как требующие перенастройки.
+			 * Полное исправление: Kotlin-слой получит ACTION_SAMPLE_RATE_UPDATED
+			 * и вызовет syncWithPreferences, который переотправит параметры
+			 * с корректным sample rate. Здесь мы только обновляем sampleRate
+			 * в структурах, чтобы новый fs использовался при следующем configure. */
+			dspmain->peq.sampleRate = newFs;
+			dspmain->loudness.sampleRate = newFs;
+			/* Помечаем loudness для перерасчёта коэффициентов */
+			dspmain->loudness.coeffsDirty = true;
+			dspmain->loudness.lastComputedVolume = 1e30;
+			/* PEQ требует полного reconfigure через Kotlin (syncWithPreferences).
+			 * Сбрасываем bandCount, чтобы избежать работы со старыми
+			 * коэффициентами до переотправки параметров. */
+			dspmain->peq.bandCount = 0;
+		}
 		*replyData = 0;
 		return 0;
 	}
@@ -214,6 +254,50 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 				replyData->vsize = 4;
 				replyData->cmd = 20002;
 				replyData->data = (int32_t)getpid();
+				*replySize = sizeof(reply1x4_1x4_t);
+				return 0;
+			}
+			else if (cmd == 30000)
+			{
+				reply1x4_1x4_t *replyData = (reply1x4_1x4_t *)pReplyData;
+				replyData->status = 0;
+				replyData->psize = 4;
+				replyData->vsize = 4;
+				replyData->cmd = 30000;
+				replyData->data = dspmain->hashSlot[0];
+				*replySize = sizeof(reply1x4_1x4_t);
+				return 0;
+			}
+			else if (cmd == 30001)
+			{
+				reply1x4_1x4_t *replyData = (reply1x4_1x4_t *)pReplyData;
+				replyData->status = 0;
+				replyData->psize = 4;
+				replyData->vsize = 4;
+				replyData->cmd = 30001;
+				replyData->data = dspmain->hashSlot[1];
+				*replySize = sizeof(reply1x4_1x4_t);
+				return 0;
+			}
+			else if (cmd == 30002)
+			{
+				reply1x4_1x4_t *replyData = (reply1x4_1x4_t *)pReplyData;
+				replyData->status = 0;
+				replyData->psize = 4;
+				replyData->vsize = 4;
+				replyData->cmd = 30002;
+				replyData->data = dspmain->hashSlot[2];
+				*replySize = sizeof(reply1x4_1x4_t);
+				return 0;
+			}
+			else if (cmd == 30003)
+			{
+				reply1x4_1x4_t *replyData = (reply1x4_1x4_t *)pReplyData;
+				replyData->status = 0;
+				replyData->psize = 4;
+				replyData->vsize = 4;
+				replyData->cmd = 30003;
+				replyData->data = dspmain->hashSlot[3];
 				*replySize = sizeof(reply1x4_1x4_t);
 				return 0;
 			}
@@ -436,6 +520,23 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 #endif
 				dspmain->samplesInc = 0;
 				int success = Convolver1DLoadImpulseResponse(&dspmain->jdsp, dspmain->tempImpulseIncoming, dspmain->impChannels, dspmain->impulseLengthActual, 1);
+				union
+				{
+					int32_t raw;
+					float f;
+				} fltInt;
+				int32_t crc = 0xFFFFFFFF;
+				for (unsigned int i = 0; i < dspmain->impulseLengthActual * dspmain->impChannels; i++)
+				{
+					fltInt.f = dspmain->tempImpulseIncoming[i];
+					crc = crc ^ fltInt.raw;
+					for (int j = 7; j >= 0; j--)
+					{
+						int32_t mask = -(crc & 1);
+						crc = (crc >> 1) ^ (0xEDB88320 & mask);
+					}
+				}
+				dspmain->engineImpulseResponseHash = ~crc;
 				free(dspmain->tempImpulseIncoming);
 				dspmain->tempImpulseIncoming = 0;
 #ifdef DEBUG
@@ -501,6 +602,74 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 				return 0;
 			}
 		}
+		if (cep->psize == 4 && cep->vsize == 4)
+		{
+			int32_t cmd = ((int32_t *)cep)[3];
+			if (cmd == 25000)
+			{
+				dspmain->hashSlot[0] = ((int32_t*)cep)[4];
+#ifdef DEBUG
+				LOGI("ArbEq hash: %d", dspmain->hashSlot[0]);
+#endif
+				*replyData = 0;
+				return 0;
+			}
+			if (cmd == 25001)
+			{
+				dspmain->hashSlot[0 + 1] = ((int32_t*)cep)[4];
+#ifdef DEBUG
+				LOGI("DDC hash: %d", dspmain->hashSlot[0 + 1]);
+#endif
+				*replyData = 0;
+				return 0;
+			}
+			if (cmd == 25002)
+			{
+				dspmain->hashSlot[0 + 2] = ((int32_t*)cep)[4];
+#ifdef DEBUG
+				LOGI("LiveProg hash: %d", dspmain->hashSlot[0 + 2]);
+#endif
+				*replyData = 0;
+				return 0;
+			}
+			if (cmd == 25003)
+			{
+				dspmain->hashSlot[0 + 3] = ((int32_t*)cep)[4];
+#ifdef DEBUG
+				LOGI("Convolver app hash: %d, engine hash: %d", dspmain->hashSlot[0 + 3], dspmain->engineImpulseResponseHash);
+#endif
+				*replyData = 0;
+				return 0;
+			}
+		}
+		if (cep->psize == 4 && cep->vsize == 16)
+		{
+			int32_t cmd = ((int32_t *)cep)[3];
+			if (cmd == 1500)
+			{
+				// Extended output control payload: [enable, threshold, release, postgain]
+				float limEnable = ((float*)cep)[4];
+				double limThreshold = (double)((float*)cep)[5];
+				double limRelease = (double)((float*)cep)[6];
+				double postgain = (double)((float*)cep)[7];
+				if (limThreshold > -0.09)
+					limThreshold = -0.09;
+				if (limRelease < 0.15)
+					limRelease = 0.15;
+				if (postgain > 15.0)
+					postgain = 15.0;
+				if (postgain < -15.0)
+					postgain = -15.0;
+				JLimiterSetEnable(&dspmain->jdsp, limEnable > 0.5f);
+				JLimiterSetCoefficients(&dspmain->jdsp, limThreshold, limRelease);
+				JamesDSPSetPostGain(&dspmain->jdsp, postgain);
+#ifdef DEBUG
+				LOGE("limEnable: %f, limThreshold: %f, limRelease: %f, postgain: %f", limEnable, limThreshold, limRelease, postgain);
+#endif
+				*replyData = 0;
+				return 0;
+			}
+		}
 		if (cep->psize == 4 && cep->vsize == 12)
 		{
 			int32_t cmd = ((int32_t *)cep)[3];
@@ -550,7 +719,7 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 				for (int i = 0; i < 7; i++)
 					LOGI("%1.7lf %1.7lf; ", param[i], param[i + 7]);
 #endif
-				CompressorSetParam(&dspmain->jdsp, timeconstant, granularity, tfresolution);
+				CompressorSetParam(&dspmain->jdsp, timeconstant, granularity, tfresolution, 0);
 				CompressorSetGain(&dspmain->jdsp, param, param + 7, 1);
 				*replyData = 0;
 				return 0;
@@ -645,6 +814,197 @@ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t 
 				return 0;
 			}
 		}
+		/* PEQ / loudness / NOS / expander enable/disable (short) */
+		if (cep->psize == 4 && cep->vsize == 2)
+		{
+			int32_t cmd = ((int32_t *)cep)[3];
+			if (cmd == 1214)
+			{
+				int16_t peqEnabled = ((int16_t *)cep)[8];
+				peq_cascade_set_enabled(&dspmain->peq, peqEnabled ? true : false);
+				*replyData = 0;
+				return 0;
+			}
+			else if (cmd == 1215)
+			{
+				int16_t loudnessEnabled = ((int16_t *)cep)[8];
+				loudness_set_enabled(&dspmain->loudness, loudnessEnabled ? true : false);
+				*replyData = 0;
+				return 0;
+			}
+			else if (cmd == 1216)
+			{
+				int16_t enabled = ((int16_t *)cep)[8];
+				if (enabled)
+					HarmonicExpanderEnable(&dspmain->jdsp);
+				else
+					HarmonicExpanderDisable(&dspmain->jdsp);
+				*replyData = 0;
+				return 0;
+			}
+			else if (cmd == 1217)
+			{
+				int16_t enabled = ((int16_t *)cep)[8];
+				if (enabled)
+					SubHarmonicExpanderEnable(&dspmain->jdsp);
+				else
+					SubHarmonicExpanderDisable(&dspmain->jdsp);
+				*replyData = 0;
+				return 0;
+			}
+			else if (cmd == 1218)
+			{
+				int16_t enabled = ((int16_t *)cep)[8];
+				if (enabled)
+					NosR2REnable(&dspmain->jdsp);
+				else
+					NosR2RDisable(&dspmain->jdsp);
+				*replyData = 0;
+				return 0;
+			}
+		}
+		/* Harmonic Expander config: 11 floats = 44 bytes
+		 * [0..8] = harmonic gains (harmonics 2–10), [9] = crossoverFreq, [10] = mix(0–100) */
+		if (cep->psize == 4 && cep->vsize == 44)
+		{
+			int32_t cmd = ((int32_t *)cep)[3];
+			if (cmd == 1305)
+			{
+				float *f = &((float*)cep)[4];
+				float gains[9];
+				for (int i = 0; i < 9; i++)
+					gains[i] = f[i];
+				HarmonicExpanderSetParam(&dspmain->jdsp, gains, f[9], f[10]);
+				*replyData = 0;
+				return 0;
+			}
+			else if (cmd == 1306)
+			{
+				float *f = &((float*)cep)[4];
+				float gains[9];
+				for (int i = 0; i < 9; i++)
+					gains[i] = f[i];
+				SubHarmonicExpanderSetParam(&dspmain->jdsp, gains, f[9], f[10]);
+				*replyData = 0;
+				return 0;
+			}
+		}
+		/* NOS R2R config: 11 floats = 44 bytes
+		 * [0] = targetRate, [1] = bitDepth, [2] = resistorTolerance,
+		 * [3] = deviationGrowth, [4] = harmony, [5] = serialLo,
+		 * [6] = serialHi, [7] = jitterAmount, [8] = harmonicsAmount,
+		 * [9] = invertPhase, [10] = unused */
+		if (cep->psize == 4 && cep->vsize == 44)
+		{
+			int32_t cmd = ((int32_t *)cep)[3];
+			if (cmd == 1307)
+			{
+				float *f = &((float*)cep)[4];
+				double targetRate = (double)f[0];
+				int bitDepth = (int)f[1];
+				double resistorTolerance = (double)f[2];
+				int deviationGrowth = (int)f[3];
+				int harmony = (int)f[4];
+				long serialNumber = ((long)(int32_t)f[5]) | ((long long)(int32_t)f[6] << 32);
+				double jitterAmount = (double)f[7];
+				double harmonicsAmount = (double)f[8];
+				int invertPhase = (int)f[9];
+				NosR2RSetParam(&dspmain->jdsp, targetRate, bitDepth, resistorTolerance,
+					deviationGrowth, harmony, serialNumber, jitterAmount,
+					harmonicsAmount, invertPhase);
+				*replyData = 0;
+				return 0;
+			}
+		}
+		/* PEQ config: variable size, 2 header floats + N bands * 5 floats each.
+		 * Accept up to PEQ_MAX_BANDS (64) = 322 floats = 1288 bytes.
+		 * Minimum: 2 floats (header only) = 8 bytes. */
+		if (cep->psize == 4 && cep->vsize >= 8 && cep->vsize <= 1288 && (cep->vsize % 4) == 0)
+		{
+			int32_t cmd = ((int32_t *)cep)[3];
+			if (cmd == 1300)
+				{
+					float *fdata = &((float*)cep)[4];
+					int numFloats = cep->vsize / 4;
+					/* Всегда используем реальную частоту дискретизации AudioFlinger
+					 * (dspmain->jdsp.fs), а не значение из Kotlin.
+					 * Kotlin может передать устаревшее значение (например 48000),
+					 * если syncWithPreferences вызвана до EFFECT_CMD_SET_CONFIG.
+					 * На устройствах вроде HiBy R4, где deep_buffer = 44100,
+					 * это приводит к сдвигу частот PEQ на 44100/48000 ≈ 1/8 октавы.
+					 * fdata[0] (sample rate из Kotlin) игнорируется намеренно. */
+					double sr = (double)dspmain->jdsp.fs;
+					peq_cascade_configure(&dspmain->peq, sr, fdata, numFloats);
+					*replyData = 0;
+					return 0;
+				}
+		}
+		/* Loudness config: 6 floats = 24 bytes (mode-aware, current app),
+		 * or 5 floats = 20 bytes (legacy app builds, mode defaults to 0).
+		 * Layout: [0] sampleRate (ignored), [1] referenceLevel,
+		 * [2] referenceOffset, [3] attenuation, [4] volume, [5] mode
+		 * (0 = classic Fletcher-Munson, 1 = ISO 226:2023) */
+		if (cep->psize == 4 && (cep->vsize == 24 || cep->vsize == 20))
+		{
+			int32_t cmd = ((int32_t *)cep)[3];
+			if (cmd == 1301)
+				{
+					float *fdata = &((float*)cep)[4];
+					int numFloats = cep->vsize / 4;
+					int mode = numFloats >= 6 ? (int)fdata[5] : 0;
+					/* Всегда используем реальную частоту AudioFlinger (dspmain->jdsp.fs).
+					 * См. комментарий в cmd == 1300 выше. fdata[0] игнорируется. */
+					double sr = (double)dspmain->jdsp.fs;
+					loudness_configure(&dspmain->loudness, sr,
+						(double)fdata[1], (double)fdata[2],
+						(double)fdata[3], (double)fdata[4], mode);
+					*replyData = 0;
+					return 0;
+				}
+		}
+		/* Loudness volume update: 1 float = 4 bytes */
+		if (cep->psize == 4 && cep->vsize == 4)
+		{
+			int32_t cmd = ((int32_t *)cep)[3];
+			if (cmd == 1302)
+			{
+				float *fdata = &((float*)cep)[4];
+				loudness_set_volume(&dspmain->loudness, (double)fdata[0]);
+				*replyData = 0;
+				return 0;
+			}
+		}
+		/* Loudness tuning: 8 floats = 32 bytes
+		 * [0] lsFreq, [1] lsSlope, [2] lsRatio,
+		 * [3] hsFreq, [4] hsSlope, [5] hsRatio, [6] isoBasePhon, [7] isoQ */
+		if (cep->psize == 4 && cep->vsize == 32)
+		{
+			int32_t cmd = ((int32_t *)cep)[3];
+			if (cmd == 1303)
+			{
+				float *fdata = &((float*)cep)[4];
+				loudness_set_tuning(&dspmain->loudness,
+					(double)fdata[0], (double)fdata[1], (double)fdata[2],
+					(double)fdata[3], (double)fdata[4], (double)fdata[5],
+					(double)fdata[6], (double)fdata[7]);
+				*replyData = 0;
+				return 0;
+			}
+		}
+		/* Loudness subsonic filter: 4 floats = 16 bytes
+		 * [0] enable, [1] freq, [2] order, [3] qFactor */
+		if (cep->psize == 4 && cep->vsize == 16)
+		{
+			int32_t cmd = ((int32_t *)cep)[3];
+			if (cmd == 1304)
+			{
+				float *fdata = &((float*)cep)[4];
+				loudness_set_subsonic(&dspmain->loudness, fdata[0] != 0.0f,
+					(double)fdata[1], (int)fdata[2], (double)fdata[3]);
+				*replyData = 0;
+				return 0;
+			}
+		}
 		return -1;
 	}
     switch (cmdCode)
@@ -704,6 +1064,54 @@ int32_t EffectDSPMainProcess(EffectDSPMain *dspmain, audio_buffer_t *in, audio_b
 	case 4:
 		dspmain->jdsp.processInt8_24Multiplexd(&dspmain->jdsp, in->s32, out->s32, actualFrameCount);
 		break;
+	}
+	/* Apply PEQ cascade and loudness correction (root version extensions).
+	 * Convert output to float interleaved, process, convert back. */
+	if (dspmain->peq.enabled || dspmain->loudness.enabled)
+	{
+		/* Use a stack buffer; blockSizeMax bounds the frame count */
+		size_t totalSamples = actualFrameCount * 2; /* stereo interleaved */
+		if (totalSamples <= 8192) /* safety limit */
+		{
+			float tmpBuf[8192];
+			switch (dspmain->formatFloatModeInt32Mode)
+			{
+			case 0: /* int16 */
+				for (size_t i = 0; i < totalSamples; i++)
+					tmpBuf[i] = (float)out->s16[i] / 32768.0f;
+				peq_cascade_process_interleaved(&dspmain->peq, tmpBuf, actualFrameCount);
+				loudness_process_interleaved(&dspmain->loudness, tmpBuf, actualFrameCount);
+				for (size_t i = 0; i < totalSamples; i++)
+				{
+					float v = tmpBuf[i] * 32768.0f;
+					if (v > 32767.0f) v = 32767.0f;
+					if (v < -32768.0f) v = -32768.0f;
+					out->s16[i] = (int16_t)v;
+				}
+				break;
+			case 1: /* float */
+				peq_cascade_process_interleaved(&dspmain->peq, out->f32, actualFrameCount);
+				loudness_process_interleaved(&dspmain->loudness, out->f32, actualFrameCount);
+				break;
+			case 2: /* int32 */
+			case 4: /* int8_24 */
+				for (size_t i = 0; i < totalSamples; i++)
+					tmpBuf[i] = (float)out->s32[i] / 8388608.0f;
+				peq_cascade_process_interleaved(&dspmain->peq, tmpBuf, actualFrameCount);
+				loudness_process_interleaved(&dspmain->loudness, tmpBuf, actualFrameCount);
+				for (size_t i = 0; i < totalSamples; i++)
+				{
+					float v = tmpBuf[i] * 8388608.0f;
+					if (v > 8388607.0f) v = 8388607.0f;
+					if (v < -8388608.0f) v = -8388608.0f;
+					out->s32[i] = (int32_t)v;
+				}
+				break;
+			case 3: /* int24 packed — rare, skip PEQ/loudness */
+			default:
+				break;
+			}
+		}
 	}
 	return dspmain->mEnable ? 0 : -ENODATA;
 }

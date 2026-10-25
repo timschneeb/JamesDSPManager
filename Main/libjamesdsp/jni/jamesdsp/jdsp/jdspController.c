@@ -4,6 +4,7 @@
 #include <math.h>
 #include <time.h>
 #include <float.h>
+#include <unistd.h>
 #include "Effects/eel2/dr_flac.h"
 #include "Effects/eel2/ns-eel.h"
 #include "jdsp_header.h"
@@ -120,17 +121,22 @@ char benchmarkEnable = 0;
 char benchmarkCompletionFlag = 0;
 double convbench_c0[MAX_BENCHMARK] = { 2.4999999e-05f,4.9999999e-05f,9.9999997e-05f,0.0002f,0.0005f,0.001f,0.0021f,0.0057f,0.0126f,0.0293f };
 double convbench_c1[MAX_BENCHMARK] = { 3.1249999e-06f,6.2499998e-06f,1.2500000e-05f,2.4999999e-05f,4.9999999e-05f,9.9999997e-05f,0.0002f,0.0004f,0.0009f,0.0019f };
-void *convBench(void *arg)
+void JamesDSP_Load_benchmark(double *_c0, double *_c1)
 {
-	size_t sleepMs = 30000; // 30 second after library being loaded
-#ifdef _WIN32
-	Sleep(sleepMs);
-#else
-	usleep(sleepMs * 1000ULL);
-#endif
-#ifdef DEBUG
-	__android_log_print(ANDROID_LOG_INFO, TAG, "Benchmark start");
-#endif
+	memcpy(convbench_c0, _c0, sizeof(convbench_c0));
+	memcpy(convbench_c1, _c1, sizeof(convbench_c1));
+	benchmarkCompletionFlag = 1;
+	benchmarkEnable = 1;
+}
+void JamesDSP_Save_benchmark(double *_c0, double *_c1)
+{
+	memcpy(_c0, convbench_c0, sizeof(convbench_c0));
+	memcpy(_c1, convbench_c1, sizeof(convbench_c1));
+}
+void JamesDSP_Start_benchmark()
+{
+    benchmarkEnable = 1;
+
 	const int sflen_start = 64;
 	int s, m;
 	int sflen_best = sflen_start;
@@ -150,12 +156,23 @@ void *convBench(void *arg)
 		_c1[s] = (tau_16 - tau_1) / 15.0;
 		_c0[s] = tau_1 - convbench_c1[s];
 	}
-	memcpy(convbench_c1, _c1, sizeof(_c1));
-	memcpy(convbench_c0, _c0, sizeof(_c0));
+	JamesDSP_Load_benchmark(_c0, _c1);
 #ifdef DEBUG
 	__android_log_print(ANDROID_LOG_INFO, TAG, "Benchmark done");
 #endif
-	benchmarkCompletionFlag = 1;
+}
+void *convBench(void *arg)
+{
+	size_t sleepMs = 30000; // 30 second after library being loaded
+#ifdef _WIN32
+	Sleep(sleepMs);
+#else
+	usleep(sleepMs * 1000ULL);
+#endif
+#ifdef DEBUG
+	__android_log_print(ANDROID_LOG_INFO, TAG, "Benchmark start");
+#endif
+	JamesDSP_Start_benchmark();
 	pthread_exit(NULL);
 	return 0;
 }
@@ -206,15 +223,14 @@ int selectConvPartitions(JamesDSPLib *jdsp, unsigned int impulseLengthActual, un
 	*seg2Len = mflen_best;
 	return type_best;
 }
-void JamesDSPGlobalMemoryAllocation(int do_benchmark)
+void JamesDSPGlobalMemoryAllocation()
 {
 	benchmarkCompletionFlag = 0;
 	NSEEL_start();
-    benchmarkEnable = do_benchmark;
-    if(do_benchmark) {
-        pthread_t benchmarkThread;
-        pthread_create(&benchmarkThread, NULL, convBench, 0);
-    }
+#ifdef JAMESDSP_REFERENCE_IMPL
+	pthread_t benchmarkThread;
+	pthread_create(&benchmarkThread, NULL, convBench, 0);
+#endif
 }
 void JamesDSPGlobalMemoryDeallocation()
 {
@@ -297,6 +313,15 @@ void JamesDSPProcess(JamesDSPLib *jdsp, size_t n)
 	// Analog modelling
 	if (jdsp->tubeEnabled)
 		VacuumTubeProcess(jdsp, n);
+	// NOS R2R Simulator
+	if (jdsp->nosR2REnabled)
+		NosR2RProcess(jdsp, n);
+	// Harmonic Expander
+	if (jdsp->harmonicExpanderEnabled)
+		HarmonicExpanderProcess(jdsp, n);
+	// Sub-Harmonic Expander
+	if (jdsp->subHarmonicExpanderEnabled)
+		SubHarmonicExpanderProcess(jdsp, n);
 	// Input / Compressor
 	if (jdsp->compEnabled)
 		CompressorProcess(jdsp, n);
@@ -335,20 +360,23 @@ void JamesDSPProcess(JamesDSPLib *jdsp, size_t n)
 	{
 		float xL = jdsp->tmpBuffer[0][i] * jdsp->postGain;
 		float xR = jdsp->tmpBuffer[1][i] * jdsp->postGain;
-		float rect1 = fabsf(xL);
-		float rect2 = fabsf(xR);
-		float maxLR = max(rect1, rect2);
-		if (maxLR < jdsp->limiter.threshold)
-			maxLR = jdsp->limiter.threshold;
-		if (maxLR > jdsp->limiter.envOverThreshold)
-			jdsp->limiter.envOverThreshold = maxLR;
-		else
-			jdsp->limiter.envOverThreshold = maxLR + jdsp->limiter.relCoef * (jdsp->limiter.envOverThreshold - maxLR);
-		float gR = jdsp->limiter.threshold / jdsp->limiter.envOverThreshold;
-		rect1 = xL * gR;
-		rect2 = xR * gR;
-		jdsp->tmpBuffer[0][i] = rect1;
-		jdsp->tmpBuffer[1][i] = rect2;
+		if (jdsp->limiter.enabled)
+		{
+			float rect1 = fabsf(xL);
+			float rect2 = fabsf(xR);
+			float maxLR = max(rect1, rect2);
+			if (maxLR < jdsp->limiter.threshold)
+				maxLR = jdsp->limiter.threshold;
+			if (maxLR > jdsp->limiter.envOverThreshold)
+				jdsp->limiter.envOverThreshold = maxLR;
+			else
+				jdsp->limiter.envOverThreshold = maxLR + jdsp->limiter.relCoef * (jdsp->limiter.envOverThreshold - maxLR);
+			float gR = jdsp->limiter.threshold / jdsp->limiter.envOverThreshold;
+			xL *= gR;
+			xR *= gR;
+		}
+		jdsp->tmpBuffer[0][i] = xL;
+		jdsp->tmpBuffer[1][i] = xR;
 	}
 }
 void JamesDSPProcessCheckBenchmarkReady(JamesDSPLib *jdsp, size_t n)
@@ -356,6 +384,15 @@ void JamesDSPProcessCheckBenchmarkReady(JamesDSPLib *jdsp, size_t n)
 	// Analog modelling
 	if (jdsp->tubeEnabled)
 		VacuumTubeProcess(jdsp, n);
+	// NOS R2R Simulator
+	if (jdsp->nosR2REnabled)
+		NosR2RProcess(jdsp, n);
+	// Harmonic Expander
+	if (jdsp->harmonicExpanderEnabled)
+		HarmonicExpanderProcess(jdsp, n);
+	// Sub-Harmonic Expander
+	if (jdsp->subHarmonicExpanderEnabled)
+		SubHarmonicExpanderProcess(jdsp, n);
 	// Input / Compressor
 	if (jdsp->compEnabled)
 		CompressorProcess(jdsp, n);
@@ -394,20 +431,23 @@ void JamesDSPProcessCheckBenchmarkReady(JamesDSPLib *jdsp, size_t n)
 	{
 		float xL = jdsp->tmpBuffer[0][i] * jdsp->postGain;
 		float xR = jdsp->tmpBuffer[1][i] * jdsp->postGain;
-		float rect1 = fabsf(xL);
-		float rect2 = fabsf(xR);
-		float maxLR = max(rect1, rect2);
-		if (maxLR < jdsp->limiter.threshold)
-			maxLR = jdsp->limiter.threshold;
-		if (maxLR > jdsp->limiter.envOverThreshold)
-			jdsp->limiter.envOverThreshold = maxLR;
-		else
-			jdsp->limiter.envOverThreshold = maxLR + jdsp->limiter.relCoef * (jdsp->limiter.envOverThreshold - maxLR);
-		float gR = jdsp->limiter.threshold / jdsp->limiter.envOverThreshold;
-		rect1 = xL * gR;
-		rect2 = xR * gR;
-		jdsp->tmpBuffer[0][i] = rect1;
-		jdsp->tmpBuffer[1][i] = rect2;
+		if (jdsp->limiter.enabled)
+		{
+			float rect1 = fabsf(xL);
+			float rect2 = fabsf(xR);
+			float maxLR = max(rect1, rect2);
+			if (maxLR < jdsp->limiter.threshold)
+				maxLR = jdsp->limiter.threshold;
+			if (maxLR > jdsp->limiter.envOverThreshold)
+				jdsp->limiter.envOverThreshold = maxLR;
+			else
+				jdsp->limiter.envOverThreshold = maxLR + jdsp->limiter.relCoef * (jdsp->limiter.envOverThreshold - maxLR);
+			float gR = jdsp->limiter.threshold / jdsp->limiter.envOverThreshold;
+			xL *= gR;
+			xR *= gR;
+		}
+		jdsp->tmpBuffer[0][i] = xL;
+		jdsp->tmpBuffer[1][i] = xR;
 	}
 	if (benchmarkCompletionFlag == 1)
 	{
@@ -895,7 +935,6 @@ void pfloat32Multiplexed(JamesDSPLib *jdsp, float *x, float *y, size_t n)
 	if (jdsp->blockSize != n)
 	{
 		jdsp->blockSize = n;
-
 		JamesDSPRefreshConvolutions(jdsp, 1);
 	}
 	for (size_t i = 0; i < n; i++)
@@ -1052,7 +1091,7 @@ void JamesDSPInit(JamesDSPLib *jdsp, int n, float sample_rate)
 	jdsp->processInt24PackedDeinterleaved = pintp24;
 	jdsp->processInternal = JamesDSPProcessCheckBenchmarkReady;
 	//
-	const unsigned int asrc_taps = 32;
+	const unsigned int asrc_taps = 64;
 	char isminphase = 1;
 	if (sample_rate < 44100.0f || sample_rate > 48000.0f)
 	{
@@ -1102,6 +1141,11 @@ void JamesDSPInit(JamesDSPLib *jdsp, int n, float sample_rate)
 	StereoEnhancementConstructor(jdsp);
 	StereoEnhancementDisable(jdsp);
 	VacuumTubeDisable(jdsp);
+	HarmonicExpanderConstructor(jdsp);
+	HarmonicExpanderDisable(jdsp);
+	SubHarmonicExpanderConstructor(jdsp);
+	SubHarmonicExpanderDisable(jdsp);
+	NosR2RDisable(jdsp);
 	LiveProgDisable(jdsp);
 	DDCConstructor(jdsp);
 	DDCDisable(jdsp);
